@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yt-history-migrator"
+version = "0.1.0"
+description = "Clean, resumable YouTube watch history migrator from Google Takeout exports."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+  "yt-dlp[default]>=2026.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+yt-migrate = "yt_history_migrator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+yt_history_migrator = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

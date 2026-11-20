@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube History Migrator</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="app-header">
+      <div class="brand-badge" aria-hidden="true">YT</div>
+      <div>
+        <h1>YouTube History Migrator</h1>
+        <p class="subtitle">Move your Google Takeout watch history to a new Gmail account in 3 steps.</p>
+      </div>
+    </header>
+
+    <nav aria-label="Migration steps">
+      <ol class="stepper">
+        <li id="nav-step-1" class="step-pill is-active" aria-current="step">
+          <span class="step-num">1</span>
+          <span class="step-text">Import Takeout Zip</span>
+        </li>
+        <li id="nav-step-2" class="step-pill">
+          <span class="step-num">2</span>
+          <span class="step-text">Sign In to New Gmail</span>
+        </li>
+        <li id="nav-step-3" class="step-pill">
+          <span class="step-num">3</span>
+          <span class="step-text">Import History</span>
+        </li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="step-1" class="wizard-card" aria-labelledby="step-1-heading">
+        <h2 id="step-1-heading" tabindex="-1">Step 1: Choose Your Google Takeout File</h2>
+        <p class="lead">
+          Drop your Google Takeout <code>.zip</code> archive (or <code>watch-history.html</code> / <code>.json</code>).
+          Ads, YouTube Music, and already-deleted videos are skipped automatically.
+        </p>
+
+        <div id="takeout-loaded-banner" class="info-banner is-success" hidden>
+          <div>
+            <strong id="loaded-filename">watch-history.html</strong>
+            <p id="loaded-summary-text" class="banner-subtext"></p>
+          </div>
+          <button type="button" id="btn-change-file" class="btn-secondary">Upload Different Zip</button>
+        </div>
+
+        <div id="upload-box" class="upload-area">
+          <label for="takeout-input" id="dropzone" class="dropzone">
+            <input
+              type="file"
+              id="takeout-input"
+              name="takeout"
+              accept=".zip,.html,.htm,.json"
+              class="visually-hidden"
+            >
+            <span class="dropzone-title">Click to choose your Takeout <code>.zip</code> file</span>
+            <span class="dropzone-hint">or drag and drop it here (processed 100% locally on your Mac)</span>
+          </label>
+
+          <div id="upload-progress-wrap" class="progress-group" hidden>
+            <label for="upload-progress" id="upload-progress-label">Uploading Takeout file...</label>
+            <progress id="upload-progress" max="100" value="0"></progress>
+          </div>
+          <p id="upload-error" class="error-text" role="alert" hidden></p>
+        </div>
+
+        <form id="step-1-form" class="wizard-form">
+          <fieldset class="scope-fieldset">
+            <legend>How much history do you want to import?</legend>
+
+            <label class="radio-card" for="scope-test5">
+              <input type="radio" id="scope-test5" name="scope" value="test5" checked>
+              <span class="radio-body">
+                <strong>Quick 5-Video Test (Recommended first)</strong>
+                <span id="scope-meta-test5" class="radio-meta">Tests your new account in ~18 seconds</span>
+              </span>
+            </label>
+
+            <label class="radio-card" for="scope-2026">
+              <input type="radio" id="scope-2026" name="scope" value="2026">
+              <span class="radio-body">
+                <strong>This Year Only (2026)</strong>
+                <span id="scope-meta-2026" class="radio-meta">Fast recent history</span>
+              </span>
+            </label>
+
+            <label class="radio-card" for="scope-2024">
+              <input type="radio" id="scope-2024" name="scope" value="2024">
+              <span class="radio-body">
+                <strong>Last 3 Years (2024 to now)</strong>
+                <span id="scope-meta-2024" class="radio-meta">Great balance for recommendations</span>
+              </span>
+            </label>
+
+            <label class="radio-card" for="scope-all">
+              <input type="radio" id="scope-all" name="scope" value="all">
+              <span class="radio-body">
+                <strong>Everything in Takeout</strong>
+                <span id="scope-meta-all" class="radio-meta">Complete history, oldest to newest</span>
+              </span>
+            </label>
+          </fieldset>
+
+          <details class="optional-filters">
+            <summary>Optional filters</summary>
+            <div class="filters-body">
+              <label class="check-option" for="opt-include-music">
+                <input type="checkbox" id="opt-include-music" name="includeMusic">
+                <span>Include YouTube Music videos</span>
+              </label>
+              <label class="check-option" for="opt-exclude-shorts">
+                <input type="checkbox" id="opt-exclude-shorts" name="excludeShorts">
+                <span>Exclude YouTube Shorts</span>
+              </label>
+            </div>
+          </details>
+
+          <p id="step-1-error" class="error-text" role="alert" hidden></p>
+
+          <div class="step-actions step-actions-end">
+            <button type="submit" id="btn-to-step-2" class="btn-primary" enterkeyhint="next">
+              Next: Sign In to New Gmail -&gt;
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section id="step-2" class="wizard-card" aria-labelledby="step-2-heading" hidden>
+        <h2 id="step-2-heading" tabindex="-1">Step 2: Sign In to Your New YouTube Account</h2>
+        <p class="lead">
+          Your Takeout file only holds history from your <strong>old</strong> account.
+          Sign in once to your <strong>new Gmail / YouTube email</strong> so we know where to import it.
+        </p>
+
+        <div id="auth-connected-card" class="info-banner is-success" hidden>
+          <div>
+            <strong>Connected to Destination YouTube Account</strong>
+            <p id="auth-account-label" class="banner-subtext">YouTube login cookies verified and saved locally.</p>
+          </div>
+          <button type="button" id="btn-switch-account" class="btn-secondary">Use Different Account</button>
+        </div>
+
+        <div id="auth-setup-card" class="auth-panel">
+          <fieldset class="browser-fieldset">
+            <legend>Browser window to open</legend>
+            <div class="browser-options">
+              <label class="browser-pill" for="browser-chrome">
+                <input type="radio" id="browser-chrome" name="browser" value="chrome" checked>
+                <span>Google Chrome (Recommended)</span>
+              </label>
+              <label class="browser-pill" for="browser-firefox">
+                <input type="radio" id="browser-firefox" name="browser" value="firefox">
+                <span>Firefox</span>
+              </label>
+              <label class="browser-pill" for="browser-brave">
+                <input type="radio" id="browser-brave" name="browser" value="brave">
+                <span>Brave</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="auth-instructions">
+            <ol>
+              <li>Click <strong>Open Sign-In Window</strong> below.</li>
+              <li>Log in with your <strong>NEW Gmail / YouTube account</strong>.</li>
+              <li>Once YouTube finishes loading, click <strong>I've Signed In — Continue</strong> (or simply close that window).</li>
+            </ol>
+          </div>
+
+          <div class="auth-buttons">
+            <button type="button" id="btn-open-login" class="btn-primary">Open Sign-In Window</button>
+            <button type="button" id="btn-confirm-login" class="btn-confirm" hidden>
+              I've Signed In — Save &amp; Close Window
+            </button>
+          </div>
+
+          <div id="auth-waiting-bar" class="progress-group" hidden>
+            <label for="auth-wait-progress">Waiting for you to sign in on the browser window...</label>
+            <progress id="auth-wait-progress"></progress>
+          </div>
+        </div>
+
+        <p id="auth-status-message" class="status-line" role="status"></p>
+        <p id="auth-error" class="error-text" role="alert" hidden></p>
+
+        <div class="step-actions">
+          <button type="button" id="btn-back-1" class="btn-secondary">Back</button>
+          <button type="button" id="btn-to-step-3" class="btn-primary">Next: Start Import -&gt;</button>
+        </div>
+      </section>
+
+      <section id="step-3" class="wizard-card" aria-labelledby="step-3-heading" hidden>
+        <h2 id="step-3-heading" tabindex="-1">Step 3: Import Watch History</h2>
+        <p id="step-3-summary" class="lead">Ready to replay your watch history oldest to newest.</p>
+
+        <fieldset class="speed-fieldset">
+          <legend>Import speed</legend>
+          <div class="browser-options">
+            <label class="browser-pill" for="speed-fast">
+              <input type="radio" id="speed-fast" name="speed" value="fast" checked>
+              <span>Fast (~0.4s/video — Recommended)</span>
+            </label>
+            <label class="browser-pill" for="speed-turbo">
+              <input type="radio" id="speed-turbo" name="speed" value="turbo">
+              <span>Turbo (~0.2s/video)</span>
+            </label>
+            <label class="browser-pill" for="speed-safe">
+              <input type="radio" id="speed-safe" name="speed" value="safe">
+              <span>Safe (~1.3s/video)</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="action-bar">
+          <button type="button" id="btn-start-import" class="btn-primary">Start Import</button>
+          <button type="button" id="btn-stop-import" class="btn-secondary" hidden>Pause Import</button>
+          <a
+            href="https://www.youtube.com/feed/history"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="btn-link"
+          >
+            Open New YouTube History ↗
+          </a>
+        </div>
+
+        <div class="progress-group">
+          <div class="progress-header">
+            <label for="import-progress" id="import-progress-label">Ready to start</label>
+            <span id="import-eta" class="eta-badge"></span>
+          </div>
+          <progress id="import-progress" max="100" value="0"></progress>
+          <p id="migration-status-announcement" class="status-line" role="status"></p>
+        </div>
+
+        <div class="metrics-grid">
+          <div class="metric-card is-watched">
+            <span class="metric-label">Watched</span>
+            <strong id="metric-watched" class="metric-value">0</strong>
+          </div>
+          <div class="metric-card is-unavailable">
+            <span class="metric-label">Unavailable</span>
+            <strong id="metric-unavailable" class="metric-value">0</strong>
+          </div>
+          <div class="metric-card is-failed">
+            <span class="metric-label">Failed</span>
+            <strong id="metric-failed" class="metric-value">0</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Remaining</span>
+            <strong id="metric-remaining" class="metric-value">0</strong>
+          </div>
+        </div>
+
+        <div id="test5-complete-banner" class="info-banner is-success" hidden>
+          <div>
+            <strong>5-Video Test Finished!</strong>
+            <p class="banner-subtext">
+              Check your new YouTube Watch History tab to confirm those 5 videos appeared, then continue the full import.
+            </p>
+          </div>
+          <div class="banner-actions">
+            <button type="button" id="btn-run-2024" class="btn-primary">Import 2024+ History</button>
+            <button type="button" id="btn-run-all" class="btn-secondary">Import All History</button>
+          </div>
+        </div>
+
+        <div id="auth-expired-banner" class="info-banner is-error" hidden>
+          <div>
+            <strong>YouTube Login Needs Refresh</strong>
+            <p id="auth-expired-text" class="banner-subtext">
+              Your progress is saved. Sign in again and click Start Import to resume where you left off.
+            </p>
+          </div>
+          <button type="button" id="btn-reauth-step2" class="btn-primary">Sign In Again</button>
+        </div>
+
+        <div class="feed-section">
+          <h3>Recent Activity</h3>
+          <ul id="recent-events-list" class="event-feed" aria-live="off"></ul>
+        </div>
+
+        <div class="step-actions">
+          <button type="button" id="btn-back-2" class="btn-secondary">Back to Sign-In</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
