@@ -3,6 +3,7 @@
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -49,12 +50,7 @@ _STATIC_ASSETS: dict[str, tuple[str, str]] = {
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
-_SCOPE_SPECS: dict[str, tuple[str | None, int | None]] = {
-    "test5": (None, 5),
-    "2026": ("2026-01-01", None),
-    "2024": ("2024-01-01", None),
-    "all": (None, None),
-}
+_SUMMARY_SCOPES = ("test5", "this_year", "last_3_years", "all")
 _AUTO_TAKEOUT_CANDIDATES = (
     "uploaded-takeout.zip",
     "uploaded-takeout.html",
@@ -74,6 +70,51 @@ class HttpApiError(Exception):
         self.message = message
 
 
+def _current_year() -> int:
+    return datetime.now(timezone.utc).year
+
+
+def _resolve_scope(
+    scope: str,
+    *,
+    after_date: str | None = None,
+    before_date: str | None = None,
+) -> tuple[str | None, str | None, int | None]:
+    """Resolve UI scope key (including legacy year aliases) to (after_date, before_date, limit)."""
+    year = _current_year()
+    if scope == "test5":
+        return (None, None, 5)
+    if scope in ("this_year", "2026"):
+        return (f"{year}-01-01", None, None)
+    if scope in ("last_3_years", "2024"):
+        return (f"{year - 2}-01-01", None, None)
+    if scope == "all":
+        return (None, None, None)
+    if scope != "custom":
+        raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown scope: '{scope}'")
+
+    try:
+        after_epoch = parse_date_bound(after_date, end_of_day=False)
+        before_epoch = parse_date_bound(before_date, end_of_day=True)
+    except ValueError as exc:
+        raise HttpApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    if after_epoch is not None and before_epoch is not None and after_epoch > before_epoch:
+        raise HttpApiError(HTTPStatus.BAD_REQUEST, "Start date must be on or before end date.")
+
+    return (after_date, before_date, None)
+
+
+def _serialize_preview_entry(entry: WatchEntry) -> dict[str, object]:
+    return {
+        "videoId": entry.video_id,
+        "url": entry.canonical_url,
+        "title": entry.title or "(untitled)",
+        "channel": entry.channel_name or "",
+        "watchedAt": entry.watched_at_raw or "",
+    }
+
+
 @dataclass
 class MigrationRuntimeState:
     """Thread-safe snapshot of the background migration runner."""
@@ -81,8 +122,15 @@ class MigrationRuntimeState:
     running: bool = False
     stopping: bool = False
     finished: bool = False
+    phase: str = "idle"
+    phase_detail: str | None = None
     scope: str = "test5"
     speed: str = "fast"
+    after_date: str | None = None
+    before_date: str | None = None
+    include_music: bool = False
+    exclude_shorts: bool = False
+    retry_unavailable: bool = False
     current_index: int = 0
     total_target: int = 0
     already_skipped: int = 0
@@ -94,7 +142,7 @@ class MigrationRuntimeState:
     interrupted: bool = False
     last_error: str | None = None
     started_at: float | None = None
-    recent_events: deque[dict[str, object]] = field(default_factory=lambda: deque(maxlen=50))
+    recent_events: deque[dict[str, object]] = field(default_factory=lambda: deque(maxlen=200))
 
 
 class WebAppController:
@@ -123,9 +171,15 @@ class WebAppController:
         self._migration = MigrationRuntimeState()
         self._stop_event = threading.Event()
         self._migration_thread: threading.Thread | None = None
+        self._shutdown_callback: Callable[[], None] | None = None
 
         self._load_initial_takeout()
         self._load_initial_cookies()
+
+    def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        """Register the server shutdown hook invoked by POST /api/server/shutdown."""
+        with self._lock:
+            self._shutdown_callback = callback
 
     @property
     def cookies_path(self) -> Path:
@@ -181,15 +235,34 @@ class WebAppController:
         store.load()
         return store
 
+    def _checkpoint_summary(self, store: ProgressStore | None = None) -> dict[str, int]:
+        active_store = store if store is not None else self._open_store()
+        counts = active_store.summary_counts()
+        return {
+            "totalRecorded": active_store.total_recorded(),
+            "watched": counts[MigrationStatus.WATCHED],
+            "unavailable": counts[MigrationStatus.UNAVAILABLE],
+            "failed": counts[MigrationStatus.FAILED],
+            "authFailed": counts[MigrationStatus.AUTH_FAILED],
+        }
+
     def _compute_scope_summary(
         self,
         entries: list[WatchEntry],
         store: ProgressStore,
+        *,
+        retry_unavailable: bool = False,
+        seconds_per_video: float = _SECONDS_PER_VIDEO_ESTIMATE,
     ) -> dict[str, dict[str, object]]:
-        pending_entries = [entry for entry in entries if not store.should_skip(entry.video_id)]
+        pending_entries = [
+            entry
+            for entry in entries
+            if not store.should_skip(entry.video_id, retry_unavailable=retry_unavailable)
+        ]
         summaries: dict[str, dict[str, object]] = {}
 
-        for scope_key, (after_date, limit) in _SCOPE_SPECS.items():
+        for scope_key in _SUMMARY_SCOPES:
+            after_date, _before_date, limit = _resolve_scope(scope_key)
             after_epoch = parse_date_bound(after_date, end_of_day=False)
             if after_epoch is None:
                 eligible = len(entries)
@@ -213,17 +286,32 @@ class WebAppController:
             summaries[scope_key] = {
                 "eligible": eligible,
                 "pending": pending,
-                "etaSeconds": round(pending * _SECONDS_PER_VIDEO_ESTIMATE),
+                "etaSeconds": round(pending * seconds_per_video),
             }
         return summaries
 
-    def get_takeout_summary(self) -> dict[str, object]:
+    def get_takeout_summary(
+        self,
+        *,
+        include_music: bool = False,
+        exclude_shorts: bool = False,
+        retry_unavailable: bool = False,
+        speed: str = "fast",
+    ) -> dict[str, object]:
         """Return summary statistics and scope counts for the loaded Takeout export."""
+        preset = SPEED_PRESETS.get(speed)
+        if preset is None:
+            raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown speed preset: '{speed}'")
+
         with self._lock:
             if self._takeout_path is None:
                 return {"loaded": False}
 
-            report = prepare_watch_entries(self._raw_items, FilterOptions())
+            options = FilterOptions(
+                include_music=include_music,
+                exclude_shorts=exclude_shorts,
+            )
+            report = prepare_watch_entries(self._raw_items, options)
             store = self._open_store()
             skipped = {
                 reason.value: report.skipped_counts.get(reason, 0)
@@ -232,6 +320,7 @@ class WebAppController:
             }
             oldest_date = report.entries[0].watched_at_raw if report.entries else None
             newest_date = report.entries[-1].watched_at_raw if report.entries else None
+            year = _current_year()
 
             return {
                 "loaded": True,
@@ -242,7 +331,17 @@ class WebAppController:
                 "skippedCounts": skipped,
                 "oldestDate": oldest_date,
                 "newestDate": newest_date,
-                "scopeCounts": self._compute_scope_summary(report.entries, store),
+                "currentYear": year,
+                "threeYearsAgoYear": year - 2,
+                "includeMusic": include_music,
+                "excludeShorts": exclude_shorts,
+                "retryUnavailable": retry_unavailable,
+                "scopeCounts": self._compute_scope_summary(
+                    report.entries,
+                    store,
+                    retry_unavailable=retry_unavailable,
+                    seconds_per_video=preset.estimated_seconds_per_video,
+                ),
             }
 
     def preview_scope(
@@ -252,10 +351,16 @@ class WebAppController:
         speed: str = "fast",
         include_music: bool,
         exclude_shorts: bool,
+        after_date: str | None = None,
+        before_date: str | None = None,
+        retry_unavailable: bool = False,
     ) -> dict[str, object]:
-        """Compute filtered eligible and pending counts for chosen UI options."""
-        if scope not in _SCOPE_SPECS:
-            raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown scope: '{scope}'")
+        """Compute filtered eligible, pending, and sample queue entries for chosen UI options."""
+        resolved_after, resolved_before, limit = _resolve_scope(
+            scope,
+            after_date=after_date,
+            before_date=before_date,
+        )
         preset = SPEED_PRESETS.get(speed)
         if preset is None:
             raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown speed preset: '{speed}'")
@@ -263,26 +368,44 @@ class WebAppController:
         with self._lock:
             if self._takeout_path is None:
                 raise HttpApiError(HTTPStatus.BAD_REQUEST, "Load a Takeout file in Step 1 first.")
-            after_date, limit = _SCOPE_SPECS[scope]
             options = FilterOptions(
                 include_music=include_music,
                 exclude_shorts=exclude_shorts,
-                after_date=after_date,
+                after_date=resolved_after,
+                before_date=resolved_before,
             )
             report: FilterReport = prepare_watch_entries(self._raw_items, options)
             store = self._open_store()
-            pending_count = sum(1 for entry in report.entries if not store.should_skip(entry.video_id))
+            pending_entries = [
+                entry
+                for entry in report.entries
+                if not store.should_skip(entry.video_id, retry_unavailable=retry_unavailable)
+            ]
+            pending_count = len(pending_entries)
             already_skipped = len(report.entries) - pending_count
-            target_count = min(pending_count, limit) if limit is not None else pending_count
+            queued = pending_entries[:limit] if limit is not None else pending_entries
+            target_count = len(queued)
+
+            sample_first = [_serialize_preview_entry(entry) for entry in queued[:3]]
+            sample_last = (
+                [_serialize_preview_entry(entry) for entry in queued[max(3, len(queued) - 3) :]]
+                if len(queued) > 3
+                else []
+            )
 
             return {
                 "scope": scope,
                 "speed": speed,
+                "afterDate": resolved_after,
+                "beforeDate": resolved_before,
+                "retryUnavailable": retry_unavailable,
                 "totalEligible": len(report.entries),
                 "alreadySkipped": already_skipped,
                 "pendingCount": pending_count,
                 "targetCount": target_count,
                 "etaSeconds": round(target_count * preset.estimated_seconds_per_video),
+                "sampleFirst": sample_first,
+                "sampleLast": sample_last,
             }
 
     def upload_takeout_stream(
@@ -375,9 +498,24 @@ class WebAppController:
         except Exception as exc:
             self._last_auth_error = str(exc)
 
-    def start_auth_window(self, *, browser: str | None, fresh: bool) -> dict[str, object]:
+    def start_auth_window(
+        self,
+        *,
+        browser: str | None,
+        fresh: bool,
+        reset_progress: bool = False,
+    ) -> dict[str, object]:
         """Launch an isolated browser window for destination Gmail / YouTube login."""
         with self._lock:
+            if reset_progress:
+                if self._migration.running:
+                    raise HttpApiError(
+                        HTTPStatus.CONFLICT,
+                        "Pause the active import before resetting the checkpoint.",
+                    )
+                self._open_store().clear()
+                self._migration = MigrationRuntimeState()
+
             if self._login_session is not None:
                 _close_browser_process(self._login_session.proc, sleep_fn=lambda _s: None)
                 self._login_session = None
@@ -432,10 +570,16 @@ class WebAppController:
         speed: str = "fast",
         include_music: bool,
         exclude_shorts: bool,
+        after_date: str | None = None,
+        before_date: str | None = None,
+        retry_unavailable: bool = False,
     ) -> dict[str, object]:
         """Start background watch history migration for the chosen scope."""
-        if scope not in _SCOPE_SPECS:
-            raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown scope: '{scope}'")
+        resolved_after, resolved_before, limit = _resolve_scope(
+            scope,
+            after_date=after_date,
+            before_date=before_date,
+        )
         preset = SPEED_PRESETS.get(speed)
         if preset is None:
             raise HttpApiError(HTTPStatus.BAD_REQUEST, f"Unknown speed preset: '{speed}'")
@@ -451,15 +595,19 @@ class WebAppController:
                     "Sign in to your new YouTube Google account in Step 2 first.",
                 )
 
-            after_date, limit = _SCOPE_SPECS[scope]
             options = FilterOptions(
                 include_music=include_music,
                 exclude_shorts=exclude_shorts,
-                after_date=after_date,
+                after_date=resolved_after,
+                before_date=resolved_before,
             )
             report = prepare_watch_entries(self._raw_items, options)
             store = self._open_store()
-            pending_count = sum(1 for entry in report.entries if not store.should_skip(entry.video_id))
+            pending_count = sum(
+                1
+                for entry in report.entries
+                if not store.should_skip(entry.video_id, retry_unavailable=retry_unavailable)
+            )
             already_skipped = len(report.entries) - pending_count
             target_count = min(pending_count, limit) if limit is not None else pending_count
 
@@ -468,8 +616,15 @@ class WebAppController:
                 running=True,
                 stopping=False,
                 finished=False,
+                phase="connecting",
+                phase_detail="Connecting to YouTube session...",
                 scope=scope,
                 speed=speed,
+                after_date=resolved_after,
+                before_date=resolved_before,
+                include_music=include_music,
+                exclude_shorts=exclude_shorts,
+                retry_unavailable=retry_unavailable,
                 total_target=target_count,
                 already_skipped=already_skipped,
                 started_at=time.monotonic(),
@@ -477,12 +632,17 @@ class WebAppController:
 
             thread = threading.Thread(
                 target=self._run_migration_worker,
-                args=(report.entries, store, limit, preset),
+                args=(report.entries, store, limit, preset, retry_unavailable),
                 daemon=True,
             )
             self._migration_thread = thread
             thread.start()
             return self.get_migration_status()
+
+    def _on_migration_phase(self, phase: str, detail: str | None) -> None:
+        with self._lock:
+            self._migration.phase = phase
+            self._migration.phase_detail = detail
 
     def _on_video_result(
         self,
@@ -519,6 +679,7 @@ class WebAppController:
         store: ProgressStore,
         limit: int | None,
         preset: SpeedPreset,
+        retry_unavailable: bool,
     ) -> None:
         try:
             summary = run_migration(
@@ -532,8 +693,10 @@ class WebAppController:
                 cooldown_every=preset.cooldown_every,
                 cooldown_seconds=preset.cooldown_seconds,
                 prefetch_workers=preset.prefetch_workers,
+                retry_unavailable=retry_unavailable,
                 stop_event=self._stop_event,
                 on_video_result=self._on_video_result,
+                on_status_change=self._on_migration_phase,
                 out=io.StringIO(),
             )
             with self._lock:
@@ -552,6 +715,13 @@ class WebAppController:
                 self._migration.running = False
                 self._migration.stopping = False
                 self._migration.finished = True
+                self._migration.phase_detail = None
+                if self._migration.aborted_on_auth or self._migration.last_error:
+                    self._migration.phase = "error"
+                elif self._migration.interrupted:
+                    self._migration.phase = "paused"
+                else:
+                    self._migration.phase = "completed"
 
     def stop_migration(self) -> dict[str, object]:
         """Request cooperative pause of the running migration thread."""
@@ -560,6 +730,37 @@ class WebAppController:
                 self._stop_event.set()
                 self._migration.stopping = True
             return self.get_migration_status()
+
+    def reset_progress(self) -> dict[str, object]:
+        """Clear saved checkpoint progress when no import is running."""
+        with self._lock:
+            if self._migration.running:
+                raise HttpApiError(
+                    HTTPStatus.CONFLICT,
+                    "Pause the active import before resetting saved progress.",
+                )
+            self._open_store().clear()
+            self._migration = MigrationRuntimeState()
+            return {
+                "checkpoint": self._checkpoint_summary(),
+                "takeout": self.get_takeout_summary(),
+                "migration": self.get_migration_status(),
+            }
+
+    def request_server_shutdown(self) -> dict[str, object]:
+        """Gracefully pause any active import and stop the HTTP server shortly after responding."""
+        with self._lock:
+            callback = self._shutdown_callback
+
+        def _shutdown() -> None:
+            self.shutdown_gracefully(timeout=2.0)
+            if callback is not None:
+                callback()
+
+        timer = threading.Timer(0.15, _shutdown)
+        timer.daemon = True
+        timer.start()
+        return {"stopping": True}
 
     def shutdown_gracefully(self, timeout: float = 2.0) -> None:
         """Pause any active import and wait briefly for its checkpoint to flush."""
@@ -585,8 +786,15 @@ class WebAppController:
                 "running": m.running,
                 "stopping": m.stopping,
                 "finished": m.finished,
+                "phase": m.phase,
+                "phaseDetail": m.phase_detail,
                 "scope": m.scope,
                 "speed": m.speed,
+                "afterDate": m.after_date,
+                "beforeDate": m.before_date,
+                "includeMusic": m.include_music,
+                "excludeShorts": m.exclude_shorts,
+                "retryUnavailable": m.retry_unavailable,
                 "currentIndex": m.current_index,
                 "totalTarget": m.total_target,
                 "alreadySkipped": m.already_skipped,
@@ -600,12 +808,17 @@ class WebAppController:
                 "interrupted": m.interrupted,
                 "lastError": m.last_error,
                 "recentEvents": list(m.recent_events),
+                "checkpoint": self._checkpoint_summary(),
             }
 
     def get_bootstrap_payload(self) -> dict[str, object]:
         """Return initial state payload for the single-page wizard."""
+        year = _current_year()
         return {
             "csrfToken": self.csrf_token,
+            "currentYear": year,
+            "threeYearsAgoYear": year - 2,
+            "checkpoint": self._checkpoint_summary(),
             "takeout": self.get_takeout_summary(),
             "auth": self.get_auth_status(),
             "migration": self.get_migration_status(),
@@ -714,6 +927,17 @@ def make_request_handler(controller: WebAppController) -> type[BaseHTTPRequestHa
             )
             self._send_json(HTTPStatus.OK, {"takeout": summary})
 
+        def _handle_post_summary(self) -> None:
+            body = _read_json_body(self)
+            speed = _as_optional_str(body.get("speed")) or "fast"
+            summary = controller.get_takeout_summary(
+                include_music=_as_bool(body.get("includeMusic")),
+                exclude_shorts=_as_bool(body.get("excludeShorts")),
+                retry_unavailable=_as_bool(body.get("retryUnavailable")),
+                speed=speed,
+            )
+            self._send_json(HTTPStatus.OK, {"takeout": summary})
+
         def _handle_post_preview(self) -> None:
             body = _read_json_body(self)
             scope = _as_optional_str(body.get("scope")) or "test5"
@@ -723,6 +947,9 @@ def make_request_handler(controller: WebAppController) -> type[BaseHTTPRequestHa
                 speed=speed,
                 include_music=_as_bool(body.get("includeMusic")),
                 exclude_shorts=_as_bool(body.get("excludeShorts")),
+                after_date=_as_optional_str(body.get("afterDate")),
+                before_date=_as_optional_str(body.get("beforeDate")),
+                retry_unavailable=_as_bool(body.get("retryUnavailable")),
             )
             self._send_json(HTTPStatus.OK, result)
 
@@ -731,6 +958,7 @@ def make_request_handler(controller: WebAppController) -> type[BaseHTTPRequestHa
             auth = controller.start_auth_window(
                 browser=_as_optional_str(body.get("browser")),
                 fresh=_as_bool(body.get("fresh")),
+                reset_progress=_as_bool(body.get("resetProgress")),
             )
             self._send_json(HTTPStatus.OK, auth)
 
@@ -747,11 +975,20 @@ def make_request_handler(controller: WebAppController) -> type[BaseHTTPRequestHa
                 speed=speed,
                 include_music=_as_bool(body.get("includeMusic")),
                 exclude_shorts=_as_bool(body.get("excludeShorts")),
+                after_date=_as_optional_str(body.get("afterDate")),
+                before_date=_as_optional_str(body.get("beforeDate")),
+                retry_unavailable=_as_bool(body.get("retryUnavailable")),
             )
             self._send_json(HTTPStatus.OK, status_payload)
 
         def _handle_post_migration_stop(self) -> None:
             self._send_json(HTTPStatus.OK, controller.stop_migration())
+
+        def _handle_post_progress_reset(self) -> None:
+            self._send_json(HTTPStatus.OK, controller.reset_progress())
+
+        def _handle_post_server_shutdown(self) -> None:
+            self._send_json(HTTPStatus.OK, controller.request_server_shutdown())
 
         def do_GET(self) -> None:
             path = urlparse(self.path).path
@@ -770,11 +1007,14 @@ def make_request_handler(controller: WebAppController) -> type[BaseHTTPRequestHa
             path = urlparse(self.path).path
             routes: dict[str, Callable[[], None]] = {
                 "/api/takeout/upload": self._handle_post_upload,
+                "/api/takeout/summary": self._handle_post_summary,
                 "/api/takeout/preview": self._handle_post_preview,
                 "/api/auth/start": self._handle_post_auth_start,
                 "/api/auth/complete": self._handle_post_auth_complete,
                 "/api/migration/start": self._handle_post_migration_start,
                 "/api/migration/stop": self._handle_post_migration_stop,
+                "/api/progress/reset": self._handle_post_progress_reset,
+                "/api/server/shutdown": self._handle_post_server_shutdown,
             }
             handler = routes.get(path)
             if handler is None:
@@ -807,4 +1047,5 @@ def create_ui_server(
     controller = WebAppController(project_dir)
     handler_cls = make_request_handler(controller)
     server = _QuickExitHTTPServer((host, port), handler_cls)
+    controller.set_shutdown_callback(server.shutdown)
     return (server, controller)

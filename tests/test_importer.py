@@ -246,3 +246,38 @@ def test_classify_exception_and_dry_run(tmp_path: Path) -> None:
     assert summary.dry_run is True
     assert summary.attempted == 0
     assert "Dry run: 2 pending videos" in out.getvalue()
+
+
+def test_run_migration_emits_phase_status_callbacks(tmp_path: Path) -> None:
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    store = ProgressStore(state_dir / "progress.jsonl")
+    store.load()
+
+    def emit_watched(url: str, logger: YtDlpWatchLogger) -> None:
+        vid = url.split("v=")[-1]
+        logger.debug(f"[youtube] {vid}: Marking fully watched")
+
+    phases: list[tuple[str, str | None]] = []
+    entries = [_entry("vid00000001"), _entry("vid00000002")]
+
+    with patch("yt_history_migrator.importer.yt_dlp.YoutubeDL", side_effect=lambda opts: _FakeYoutubeDL(opts, emit_watched)):
+        summary = run_migration(
+            entries,
+            store,
+            state_dir,
+            cookies_path=cookies,
+            min_delay=0.0,
+            max_delay=0.0,
+            cooldown_every=1,
+            cooldown_seconds=1.0,
+            sleep_fn=lambda _secs: None,
+            on_status_change=lambda phase, detail: phases.append((phase, detail)),
+            out=io.StringIO(),
+        )
+
+    assert summary.watched == 2
+    assert ("connecting", "Connecting to YouTube session...") in phases
+    assert ("importing", None) in phases
+    assert any(phase == "cooldown" and detail is not None for phase, detail in phases)

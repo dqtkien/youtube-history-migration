@@ -103,6 +103,14 @@ class ProgressStore:
             counts[rec.status] += 1
         return counts
 
+    def clear(self) -> None:
+        """Erase all in-memory and on-disk checkpoint records."""
+        if self._append_handle is not None:
+            self._append_handle.close()
+            self._append_handle = None
+        self._records.clear()
+        self._path.unlink(missing_ok=True)
+
 
 def _decode_progress_line(line: str, line_num: int) -> ProgressRecord | None:
     try:

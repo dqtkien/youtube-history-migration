@@ -130,7 +130,7 @@ def _handle_inspect(args: argparse.Namespace) -> int:
     newest = _format_entry_date(report.entries[-1])
     est_runtime = _format_duration(len(report.entries) * _ESTIMATED_SECONDS_PER_VIDEO)
     print(f"Date span (oldest->newest): {oldest} -> {newest}")
-    print(f"Estimated runtime (~3.5s) : {est_runtime}")
+    print(f"Estimated runtime (~0.4s) : {est_runtime}")
 
     channel_counts = Counter(
         entry.channel_name for entry in report.entries if entry.channel_name

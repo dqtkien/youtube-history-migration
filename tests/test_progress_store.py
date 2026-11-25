@@ -77,3 +77,7 @@ def test_progress_store_persists_reloads_and_controls_resume_skip(tmp_path: Path
     assert counts[MigrationStatus.UNAVAILABLE] == 1
     assert counts[MigrationStatus.FAILED] == 0
     assert counts[MigrationStatus.AUTH_FAILED] == 1
+
+    final_store.clear()
+    assert final_store.total_recorded() == 0
+    assert not progress_file.exists()

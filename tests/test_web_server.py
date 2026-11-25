@@ -132,11 +132,15 @@ def test_ui_serves_html_and_bootstrap(running_ui: tuple[str, WebAppController]) 
         assert resp.status == 200
         html = resp.read().decode("utf-8")
         assert "<!DOCTYPE html>" in html
+        assert '<meta name="color-scheme" content="light dark">' in html
+        assert "<dialog" in html
         assert "<progress" in html
 
     status, boot = _request_json(f"{base_url}/api/bootstrap")
     assert status == 200
     assert isinstance(boot["csrfToken"], str)
+    assert isinstance(boot["currentYear"], int)
+    assert isinstance(boot["checkpoint"], dict)
     takeout = boot["takeout"]
     assert isinstance(takeout, dict)
     assert takeout["loaded"] is False
@@ -235,9 +239,163 @@ def test_ui_upload_auth_and_migration_flow(running_ui: tuple[str, WebAppControll
             time.sleep(0.05)
 
     assert final_status.get("finished") is True
+    assert final_status.get("phase") == "completed"
     assert final_status.get("watched") == 2
     assert final_status.get("remaining") == 0
     assert controller.progress_path.exists()
+
+
+def test_ui_summary_custom_preview_reset_and_shutdown(
+    running_ui: tuple[str, WebAppController],
+    tmp_path: Path,
+) -> None:
+    base_url, controller = running_ui
+    _, boot = _request_json(f"{base_url}/api/bootstrap")
+    csrf = str(boot["csrfToken"])
+
+    payload = [
+        {
+            "header": "YouTube",
+            "title": "Watched Older Video",
+            "titleUrl": "https://www.youtube.com/watch?v=older123456",
+            "subtitles": [{"name": "Chan A"}],
+            "time": "2023-05-01T10:00:00Z",
+        },
+        {
+            "header": "YouTube Music",
+            "title": "Watched Music Track",
+            "titleUrl": "https://music.youtube.com/watch?v=music123456",
+            "subtitles": [{"name": "Artist"}],
+            "time": "2025-03-01T10:00:00Z",
+        },
+        {
+            "header": "YouTube",
+            "title": "Watched Recent Short",
+            "titleUrl": "https://www.youtube.com/shorts/short123456",
+            "subtitles": [{"name": "Chan B"}],
+            "time": "2026-04-01T10:00:00Z",
+        },
+    ]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "Takeout/YouTube and YouTube Music/history/watch-history.json",
+            json.dumps(payload),
+        )
+
+    up_status, _ = _request_json(
+        f"{base_url}/api/takeout/upload",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "X-Filename": "takeout.zip"},
+        body=buf.getvalue(),
+    )
+    assert up_status == 200
+
+    # Dynamic summary recalculates when includeMusic / excludeShorts toggle.
+    sum_code, sum_body = _request_json(
+        f"{base_url}/api/takeout/summary",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+        body=json.dumps({"includeMusic": True, "excludeShorts": True}).encode("utf-8"),
+    )
+    assert sum_code == 200
+    takeout_summary = sum_body["takeout"]
+    assert isinstance(takeout_summary, dict)
+    assert takeout_summary["uniqueVideos"] == 2
+
+    # Custom date preview filters accurately and returns sampleFirst.
+    prev_code, prev_body = _request_json(
+        f"{base_url}/api/takeout/preview",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+        body=json.dumps({
+            "scope": "custom",
+            "afterDate": "2025-01-01",
+            "beforeDate": "2026-12-31",
+            "includeMusic": True,
+            "excludeShorts": False,
+        }).encode("utf-8"),
+    )
+    assert prev_code == 200
+    assert prev_body["targetCount"] == 2
+    sample_first = prev_body["sampleFirst"]
+    assert isinstance(sample_first, list) and len(sample_first) == 2
+
+    # Invalid custom date range returns 400.
+    bad_prev_code, _ = _request_json(
+        f"{base_url}/api/takeout/preview",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+        body=json.dumps({
+            "scope": "custom",
+            "afterDate": "2026-05-01",
+            "beforeDate": "2026-01-01",
+        }).encode("utf-8"),
+    )
+    assert bad_prev_code == http.client.BAD_REQUEST
+
+    # Write a checkpoint record and verify POST /api/progress/reset clears it.
+    controller.progress_path.parent.mkdir(parents=True, exist_ok=True)
+    controller.progress_path.write_text(
+        json.dumps({
+            "video_id": "older123456",
+            "status": "watched",
+            "title": "Older Video",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "reason": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    reset_code, reset_body = _request_json(
+        f"{base_url}/api/progress/reset",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+        body=b"{}",
+    )
+    assert reset_code == 200
+    checkpoint = reset_body["checkpoint"]
+    assert isinstance(checkpoint, dict)
+    assert checkpoint["totalRecorded"] == 0
+    assert not controller.progress_path.exists()
+
+    # Auth start with resetProgress=True clears checkpoint before launching browser.
+    controller.progress_path.write_text(
+        json.dumps({
+            "video_id": "older123456",
+            "status": "watched",
+            "title": "Older Video",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "reason": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    fake_session = BrowserLoginSession(
+        browser_name="firefox",
+        profile_dir=tmp_path / "state" / "firefox-auth-profile",
+        proc=_DummyProc(),  # type: ignore[arg-type]
+    )
+    with patch("yt_history_migrator.web_server.start_browser_login_session", return_value=fake_session):
+        auth_code, _ = _request_json(
+            f"{base_url}/api/auth/start",
+            method="POST",
+            headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+            body=json.dumps({"browser": "firefox", "fresh": True, "resetProgress": True}).encode("utf-8"),
+        )
+        assert auth_code == 200
+    assert not controller.progress_path.exists()
+
+    # POST /api/server/shutdown invokes the registered shutdown callback.
+    called = threading.Event()
+    controller.set_shutdown_callback(called.set)
+    shut_code, shut_body = _request_json(
+        f"{base_url}/api/server/shutdown",
+        method="POST",
+        headers={"X-CSRF-Token": csrf, "Content-Type": "application/json"},
+        body=b"{}",
+    )
+    assert shut_code == 200
+    assert shut_body["stopping"] is True
+    assert called.wait(timeout=2.0)
 
 
 def test_server_close_does_not_hang_on_keepalive_socket(tmp_path: Path) -> None:

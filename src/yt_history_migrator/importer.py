@@ -19,6 +19,7 @@ from yt_history_migrator.models import MigrationStatus, ProgressRecord, WatchEnt
 from yt_history_migrator.progress_store import ProgressStore
 
 ProgressCallback = Callable[[int, int, WatchEntry, MigrationStatus, str | None], None]
+StatusCallback = Callable[[str, str | None], None]
 
 _FALLBACK_NODE_PATHS = (
     "/opt/homebrew/opt/node@22/bin/node",
@@ -287,6 +288,11 @@ def _interruptible_wait(
     return False
 
 
+def _emit_status(cb: StatusCallback | None, phase: str, detail: str | None = None) -> None:
+    if cb is not None:
+        cb(phase, detail)
+
+
 def _maybe_sleep_between_videos(
     index: int,
     total: int,
@@ -297,6 +303,7 @@ def _maybe_sleep_between_videos(
     cooldown_seconds: float,
     sleep_fn: Callable[[float], None],
     stop_event: threading.Event | None,
+    on_status_change: StatusCallback | None,
     out: TextIO,
 ) -> bool:
     if index >= total:
@@ -305,11 +312,19 @@ def _maybe_sleep_between_videos(
     if _interruptible_wait(delay, stop_event, sleep_fn):
         return True
     if cooldown_every > 0 and cooldown_seconds > 0 and index % cooldown_every == 0:
+        _emit_status(
+            on_status_change,
+            "cooldown",
+            f"Safety cooldown pause ({cooldown_seconds:.0f}s) after {index} videos...",
+        )
         print(
             f"Cooldown pause ({cooldown_seconds:.1f}s) after {index} videos...",
             file=out,
         )
-        return _interruptible_wait(cooldown_seconds, stop_event, sleep_fn)
+        interrupted = _interruptible_wait(cooldown_seconds, stop_event, sleep_fn)
+        if not interrupted:
+            _emit_status(on_status_change, "importing", None)
+        return interrupted
     return False
 
 
@@ -375,6 +390,7 @@ def _run_fast_loop(
     sleep_fn: Callable[[float], None],
     stop_event: threading.Event | None,
     on_video_result: ProgressCallback | None,
+    on_status_change: StatusCallback | None,
     output: TextIO,
 ) -> tuple[dict[MigrationStatus, int], int, bool, bool]:
     counts: dict[MigrationStatus, int] = {status: 0 for status in MigrationStatus}
@@ -399,10 +415,12 @@ def _run_fast_loop(
             idx, item = nxt
             in_flight.append((idx, item, pool.submit(marker.prefetch_player, item.video_id)))
 
+    _emit_status(on_status_change, "connecting", "Connecting to YouTube session...")
     with FastYoutubeMarker(
         session_cookiefile=session_cookiefile,
         cookies_from_browser=browser_tuple,
     ) as marker:
+        _emit_status(on_status_change, "importing", None)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             try:
                 fill_window(pool, marker)
@@ -416,10 +434,16 @@ def _run_fast_loop(
                     prefetched = future.result()
 
                     if prefetched.rate_limited:
+                        _emit_status(
+                            on_status_change,
+                            "rate_limited",
+                            "YouTube rate-limited requests (HTTP 429). Cooling down 25s before retrying...",
+                        )
                         print("Rate limited (HTTP 429); cooling down 25s before retry...", file=output)
                         if _interruptible_wait(25.0, stop_event, sleep_fn):
                             interrupted = True
                             break
+                        _emit_status(on_status_change, "importing", None)
                         prefetched = marker.prefetch_player(entry.video_id)
                         if prefetched.rate_limited:
                             prefetched = PrefetchedPlayer(
@@ -455,6 +479,7 @@ def _run_fast_loop(
                         cooldown_seconds=cooldown_seconds,
                         sleep_fn=sleep_fn,
                         stop_event=stop_event,
+                        on_status_change=on_status_change,
                         out=output,
                     ):
                         interrupted = True
@@ -483,6 +508,7 @@ def _run_ytdlp_loop(
     sleep_fn: Callable[[float], None],
     stop_event: threading.Event | None,
     on_video_result: ProgressCallback | None,
+    on_status_change: StatusCallback | None,
     output: TextIO,
 ) -> tuple[dict[MigrationStatus, int], int, bool, bool]:
     watch_logger = YtDlpWatchLogger()
@@ -499,7 +525,9 @@ def _run_ytdlp_loop(
     aborted_auth = False
     interrupted = False
 
+    _emit_status(on_status_change, "connecting", "Connecting to YouTube session...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        _emit_status(on_status_change, "importing", None)
         try:
             for index, entry in enumerate(pending, start=1):
                 if stop_event is not None and stop_event.is_set():
@@ -533,6 +561,7 @@ def _run_ytdlp_loop(
                     cooldown_seconds=cooldown_seconds,
                     sleep_fn=sleep_fn,
                     stop_event=stop_event,
+                    on_status_change=on_status_change,
                     out=output,
                 ):
                     interrupted = True
@@ -564,6 +593,7 @@ def run_migration(
     sleep_fn: Callable[[float], None] = time.sleep,
     stop_event: threading.Event | None = None,
     on_video_result: ProgressCallback | None = None,
+    on_status_change: StatusCallback | None = None,
     out: TextIO | None = None,
 ) -> MigrationSummary:
     """Replay watch history entries oldest -> newest and persist progress after every video."""
@@ -633,6 +663,7 @@ def run_migration(
         "sleep_fn": sleep_fn,
         "stop_event": stop_event,
         "on_video_result": on_video_result,
+        "on_status_change": on_status_change,
         "output": output,
     }
 
